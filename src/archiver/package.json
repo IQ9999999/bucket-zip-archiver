@@ -1,0 +1,27 @@
+{
+  "name": "s3-zip-archiver",
+  "version": "1.0.0",
+  "description": "AWS Lambda that compresses new S3 objects into ZIP archives and removes the originals",
+  "private": true,
+  "type": "module",
+  "main": "app.mjs",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "lint": "eslint .",
+    "test": "node --test \"tests/**/*.test.mjs\""
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "3.1134.0",
+    "@aws-sdk/lib-storage": "3.1134.0",
+    "archiver": "8.0.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "adm-zip": "0.6.1",
+    "aws-sdk-client-mock": "4.1.0",
+    "eslint": "10.10.0",
+    "globals": "17.12.0"
+  }
+}
