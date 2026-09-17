@@ -1,16 +1,18 @@
 STACK_NAME   ?= s3-zip-archiver
 AWS_REGION   ?= ap-southeast-1
 FUNCTION_DIR := src/archiver
+RELEASE_ID ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo manual)-$(shell date -u +%Y%m%d%H%M%S)
+PARAMETER_OVERRIDES ?= ApplicationLogLevel=INFO LogRetentionInDays=14
 
 # Override to use alternative installs, e.g. SAM="uvx --from aws-sam-cli sam"
 SAM      ?= sam
 CFN_LINT ?= cfn-lint
 
 .DEFAULT_GOAL := help
-.PHONY: help install lint test validate build deploy rollback delete clean
+.PHONY: help install lint test e2e validate build deploy rollback delete clean
 
 help: ## List available targets
-	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-10s %s\n", $$1, $$2}'
+	@grep -E '^[a-z0-9-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-10s %s\n", $$1, $$2}'
 
 install: ## Install function dependencies
 	cd $(FUNCTION_DIR) && npm ci
@@ -22,6 +24,9 @@ lint: ## Lint the function code and the CloudFormation template
 test: ## Run unit tests
 	cd $(FUNCTION_DIR) && npm test
 
+e2e: ## Run local end-to-end tests
+	scripts/e2e-local.sh
+
 validate: ## Validate the SAM template
 	$(SAM) validate --lint --region $(AWS_REGION)
 
@@ -29,7 +34,7 @@ build: ## Build the Lambda container image
 	$(SAM) build
 
 deploy: build ## Build and deploy the stack (publishes a new Lambda version)
-	$(SAM) deploy --stack-name $(STACK_NAME) --region $(AWS_REGION)
+	$(SAM) deploy --stack-name $(STACK_NAME) --region $(AWS_REGION) --parameter-overrides "$(PARAMETER_OVERRIDES) ReleaseId=$(RELEASE_ID)"
 
 rollback: ## Move the live alias back: make rollback [VERSION=previous|<n>]
 	STACK_NAME=$(STACK_NAME) AWS_REGION=$(AWS_REGION) scripts/rollback.sh $(VERSION)

@@ -28,7 +28,7 @@ current="$(aws lambda get-alias --function-name "$function_name" --name "$ALIAS"
 if [[ $# -eq 0 ]]; then
   echo "Alias '$ALIAS' of $function_name -> version $current"
   aws lambda list-versions-by-function --function-name "$function_name" \
-    --query "Versions[?Version!='\$LATEST'].[Version, LastModified, CodeSha256]" \
+    --query "Versions[?Version!='\$LATEST'].[Version, LastModified, CodeSha256, Description]" \
     --output table
   echo "Roll back with: $0 previous | $0 <version>"
   exit 0

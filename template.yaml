@@ -1,22 +1,35 @@
 AWSTemplateFormatVersion: "2010-09-09"
-Transform: AWS::Serverless-2016-10-31
+Transform:
+  - AWS::LanguageExtensions
+  - AWS::Serverless-2016-10-31
 Description: >
   S3 ZIP archiver - compresses every new object uploaded to the archive
   bucket into a ZIP file in the same bucket and removes the original.
 
 Parameters:
+  ReleaseId:
+    Type: String
+    Default: 'manual'
+    AllowedPattern: '^[A-Za-z0-9._-]{1,64}$'
+    Description: Release label, e.g. git SHA + UTC timestamp; a new value publishes a new Lambda version.
+  BucketNamePrefix:
+    Type: String
+    Default: s3-zip-archiver
+    AllowedPattern: '^[a-z0-9](?:[a-z0-9-]{0,28}[a-z0-9])?$'
+    Description: Lowercase S3-safe bucket name prefix, up to 30 characters.
   SourcePrefix:
     Type: String
-    Default: incoming/
-    AllowedPattern: "^[^/].*/$"
-    Description: Key prefix that triggers archiving. Must end with "/".
+    Default: ''
+    AllowedPattern: '^([^/].*/)?$'
+    Description: Key prefix that triggers archiving. Empty means every new object; otherwise must end with "/".
   ArchivePrefix:
     Type: String
     Default: archived/
     AllowedPattern: "^[^/].*/$"
     Description: >
-      Key prefix the ZIP archives are written to. Must not overlap with
-      SourcePrefix, otherwise archives would re-trigger the function.
+      Key prefix the ZIP archives are written to. The handler skips keys under
+      this prefix, so archives re-invoke the function once when the trigger
+      covers them and are then skipped, preventing an infinite loop.
   CompressionLevel:
     Type: Number
     Default: 6
@@ -57,6 +70,7 @@ Parameters:
     AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
 
 Conditions:
+  HasSourcePrefix: !Not [!Equals [!Ref SourcePrefix, ""]]
   HasAlarmTopic: !Not [!Equals [!Ref AlarmTopicArn, ""]]
 
 Resources:
@@ -138,7 +152,12 @@ Resources:
               - s3:AbortMultipartUpload
               - s3:DeleteObject
               - s3:DeleteObjectVersion
-            Resource: !Sub arn:${AWS::Partition}:s3:::${AWS::StackName}-${AWS::AccountId}-${AWS::Region}/*
+            Resource: !Sub arn:${AWS::Partition}:s3:::${BucketNamePrefix}-${AWS::AccountId}-${AWS::Region}/*
+          - Sid: ListArchiveBucket
+            Effect: Allow
+            Principal: "*"
+            Action: s3:ListBucket
+            Resource: !Sub arn:${AWS::Partition}:s3:::${BucketNamePrefix}-${AWS::AccountId}-${AWS::Region}
 
   ArchiverSecurityGroup:
     Type: AWS::EC2::SecurityGroup
@@ -159,11 +178,14 @@ Resources:
   # ---------------------------------------------------------------------------
   ArchiveBucket:
     Type: AWS::S3::Bucket
+    # Archived data must survive stack deletion; retention also avoids non-empty bucket delete failures.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       # The name is computed rather than referenced with !Ref from the
       # function policy: the bucket's notification configuration already
       # depends on the function, so a !Ref back would be circular.
-      BucketName: !Sub ${AWS::StackName}-${AWS::AccountId}-${AWS::Region}
+      BucketName: !Sub ${BucketNamePrefix}-${AWS::AccountId}-${AWS::Region}
       BucketEncryption:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
@@ -196,8 +218,8 @@ Resources:
             Principal: "*"
             Action: s3:*
             Resource:
-              - !GetAtt ArchiveBucket.Arn
-              - !Sub ${ArchiveBucket.Arn}/*
+              - !Sub arn:${AWS::Partition}:s3:::${BucketNamePrefix}-${AWS::AccountId}-${AWS::Region}
+              - !Sub arn:${AWS::Partition}:s3:::${BucketNamePrefix}-${AWS::AccountId}-${AWS::Region}/*
             Condition:
               Bool:
                 aws:SecureTransport: false
@@ -216,6 +238,7 @@ Resources:
       # (see scripts/rollback.sh).
       AutoPublishAlias: live
       AutoPublishAliasAllProperties: true
+      VersionDescription: !Sub 'release ${ReleaseId}'
       # SAM also attaches AWSLambdaVPCAccessExecutionRole so Lambda can manage
       # the function's network interfaces.
       VpcConfig:
@@ -242,6 +265,7 @@ Resources:
             Destination: !GetAtt FailedEventsQueue.Arn
       Environment:
         Variables:
+          RELEASE_ID: !Ref ReleaseId
           SOURCE_PREFIX: !Ref SourcePrefix
           ARCHIVE_PREFIX: !Ref ArchivePrefix
           COMPRESSION_LEVEL: !Ref CompressionLevel
@@ -258,18 +282,24 @@ Resources:
                 - s3:AbortMultipartUpload
                 - s3:DeleteObject
                 - s3:DeleteObjectVersion
-              Resource: !Sub arn:${AWS::Partition}:s3:::${AWS::StackName}-${AWS::AccountId}-${AWS::Region}/*
+              Resource: !Sub arn:${AWS::Partition}:s3:::${BucketNamePrefix}-${AWS::AccountId}-${AWS::Region}/*
+            - Sid: ListArchiveBucket
+              Effect: Allow
+              Action: s3:ListBucket
+              Resource: !Sub arn:${AWS::Partition}:s3:::${BucketNamePrefix}-${AWS::AccountId}-${AWS::Region}
       Events:
         ObjectCreated:
           Type: S3
           Properties:
             Bucket: !Ref ArchiveBucket
             Events: s3:ObjectCreated:*
-            Filter:
-              S3Key:
-                Rules:
-                  - Name: prefix
-                    Value: !Ref SourcePrefix
+            Filter: !If
+              - HasSourcePrefix
+              - S3Key:
+                  Rules:
+                    - Name: prefix
+                      Value: !Ref SourcePrefix
+              - !Ref AWS::NoValue
     Metadata:
       Dockerfile: Dockerfile
       DockerContext: ./src/archiver
