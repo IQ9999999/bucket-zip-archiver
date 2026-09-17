@@ -34,7 +34,7 @@ For each `ObjectCreated` event the function:
 2. Reads the object with `If-Match` on the ETag from the event, so it archives exactly the object the event describes. A missing or overwritten object means an earlier or newer event owns it.
 3. Streams the object through a ZIP encoder straight into an S3 upload (multipart for large archives) at `archived/<original key>.zip`, using `If-None-Match: *` so an existing archive is never overwritten.
 4. Confirms the stored archive with `HeadObject`.
-5. Deletes the original with `If-Match` on its ETag, or by version ID in a versioned bucket, so an object written to the same key in the meantime is never deleted.
+5. Deletes the original with `If-Match` on its ETag, or by version ID in a versioned bucket, so a different object written to the same key in the meantime is never deleted.
 
 If any step fails, the invocation fails. Lambda retries it twice and then sends the event to an SQS queue watched by an alarm. The original object stays in the bucket until its archive is confirmed.
 
@@ -81,17 +81,17 @@ If any step fails, the invocation fails. Lambda retries it twice and then sends 
 
 ## Design decisions
 
-**Streaming instead of buffering.** The S3 response body is piped through `archiver` into `@aws-sdk/lib-storage`. Memory use is bounded by the 5 MiB part size, not by the object size, and `/tmp` is not used, so the default memory and ephemeral storage settings handle objects far larger than 10 MB.
+**Streaming instead of buffering.** The S3 response body is piped through `archiver` into `@aws-sdk/lib-storage`. Memory use is bounded by the upload buffer (by default four concurrent 5 MiB parts, ~20 MiB, plus compression and runtime overhead), not by the object size, and `/tmp` is not used, so the default memory and ephemeral storage settings handle objects far larger than 10 MB.
 
 **Nothing is deleted or overwritten without proof.** S3 delivers events at least once, and Lambda retries asynchronous invocations, so every step is safe to repeat:
 
 | Situation | Behaviour |
 | --- | --- |
 | Duplicate event after success | `GetObject` returns 404 and the record is skipped. `s3:ListBucket` is granted so S3 answers 404 instead of 403. |
-| Retry after the archive was stored but the delete failed | The conditional upload returns 412, the existing archive's `source-etag` metadata and size match, it is reused and the source is deleted. |
+| Retry after the archive was stored but the delete failed | The conditional upload returns 412. If the existing archive's `source-etag` metadata matches the source and its size equals the ZIP this attempt produced, it is reused and the source is deleted. |
 | Key overwritten before it was read | `GetObject` with `If-Match` returns 412 and the record is skipped. The newer object's own event archives it. |
-| Key overwritten while archiving | The conditional `DeleteObject` returns 412 and the newer object is kept. |
-| Archive key already holds another generation of the same key | The archive is written to `archived/<key>.<etag>.zip` instead of replacing it. |
+| Key overwritten with different content while archiving | The conditional `DeleteObject` returns 412 and the newer object is kept. |
+| Archive key already holds another generation of the same key | The archive is written to `archived/<key>.<version-id or etag>.zip` instead of replacing it. If that key is also taken by a different generation, the invocation fails rather than overwrite anything. |
 | Upload or source stream fails mid-way | The body stream is failed first, so a partial ZIP is never completed, and the multipart upload is aborted. A lifecycle rule also removes incomplete uploads after one day as a backstop. |
 | Archive key would exceed S3's 1,024-byte limit | The archive goes to `archived/_long-keys/<sha256>.zip` and the full key is kept as the ZIP entry name. |
 
@@ -198,7 +198,7 @@ The estimate is most sensitive to Lambda duration (each additional 0.1 s per fil
 
 In order of impact:
 
-1. **Choose the storage class by access pattern. This is the biggest lever at this scale.** If archives are rarely read after the first weeks, deploy with `ArchiveStorageClass=INTELLIGENT_TIERING`. It adds no request or retrieval surcharges and moves untouched archives to $0.005/GB-month after 90 days, saving about $24,000 per month for each month of data kept. If archives are almost never read and kept for months, `GLACIER_IR` saves more per GB from day one. Its higher PUT and HEAD prices (+$18,000 a month) pay off only for data kept longer than about three weeks, and reads cost $0.03/GB. Add lifecycle expiration once a retention period is agreed.
+1. **Choose the storage class by access pattern. This is the biggest lever at this scale.** If archives are rarely read after the first weeks, deploy with `ArchiveStorageClass=INTELLIGENT_TIERING`. It adds no request or retrieval surcharges and moves untouched archives to $0.005/GB-month after 90 days, saving about $24,000 per month for each month of data kept. If archives are almost never read and kept for months, `GLACIER_IR` saves more per GB from day one. Its higher PUT and HEAD prices (+$18,000 a month) and 90-day minimum storage charge pay off only for data kept longer than about five weeks, and reads cost $0.03/GB. Add lifecycle expiration once a retention period is agreed.
 2. **Compress on-premises before uploading.** This removes the function's ~$11,700 a month entirely and cuts upload bandwidth by about 79%. Upload bandwidth is also the main throughput constraint (see below).
 3. **Bundle results** (many files per archive, per video or per batch). About $2,500 a month in fewer requests and logs, plus better compression across similar JSON documents.
 4. **Buy a Compute Savings Plan** for the steady Lambda baseline: up to 17% of duration, about $1,200 a month.
@@ -208,7 +208,7 @@ In order of impact:
 
 ## Scalability and bottlenecks
 
-**Short answer:** yes, the solution scales to 1,000,000 files per hour without re-architecture, and it pays for itself many times over. The feature costs about $11,700 per month and cuts the storage bill by about $123,000 for every month of data retained. It is not the cheapest possible design at this volume, though: with one invocation and one archive per file, per-object request charges make up almost 40% of the feature cost, and several limits need to be raised or watched before production.
+**Short answer:** yes, on paper. Nothing in the design has to change to handle 1,000,000 files per hour, and the storage savings far outweigh the running cost, provided the estimated duration and compression ratio hold. Capacity still needs a production-scale load test. The feature costs about $11,700 per month and cuts the storage bill by about $123,000 for every month of data retained. It is not the cheapest possible design at this volume, though: with one invocation and one archive per file, per-object request charges make up almost 40% of the feature cost, and several limits need to be raised or watched before production.
 
 ### Load at the target volume
 
@@ -217,22 +217,22 @@ In order of impact:
 | Lambda invocations | 278/s archiving + 278/s skipped archive events | No invocation-rate quota for async S3 events | n/a |
 | Lambda concurrency | ~200 (278/s x 0.71 s) | 1,000 per account and region by default, shared by every function; new accounts can start lower | ~5x at average load; a 3x hourly peak reaches ~600 |
 | Lambda scale-up rate | | +1,000 concurrent executions every 10 s per function | Sufficient |
-| S3 writes (ingest PUT + archive PUT + DELETE) | ~834/s | 3,500/s per partitioned prefix | ~4x per prefix |
-| S3 reads (GET + HEAD) | ~556/s | 5,500/s per partitioned prefix | ~10x per prefix |
+| S3 writes (ingest PUT + archive PUT + DELETE) | ~834/s | At least 3,500/s per partitioned prefix | ~4x per prefix |
+| S3 reads (GET + HEAD) | ~556/s | At least 5,500/s per partitioned prefix | ~10x per prefix |
 | VPC IP addresses | A few Hyperplane ENIs shared per subnet and security group | 8,187 IPs per /19 subnet; 65,000 connections per Hyperplane ENI | Not a constraint |
 | Network to S3 | ~2.8 GB/s in from on-premises, ~3.4 GB/s via the gateway endpoint | Gateway endpoints have no throughput limit or charge | Not a constraint in AWS |
 
 ### Concerns and potential bottlenecks
 
 1. **Account concurrency is shared.** About 200 steady executions, and roughly 600 at a 3x peak, sit on the default regional quota of 1,000 that every other function in the account also uses. If the quota is hit, S3 events are throttled and queued, Lambda retries them for up to 6 hours, and then they go to the failure queue. Before go-live, request a quota increase. Consider reserved concurrency to protect other workloads, and alarm on `Throttles`, `AsyncEventAge` and `AsyncEventsDropped`.
-2. **S3 request rate per prefix.** About 834 writes per second on a bucket that also receives the uploads is within the per-prefix limit, but S3 repartitions gradually. Traffic concentrated on one prefix (for example a single date folder) or a sudden ramp-up can return `503 SlowDown`. The client retries with backoff (5 attempts), but sustained throttling adds latency and cost. Use high-cardinality key prefixes, for example `<yyyy>/<mm>/<dd>/<hh>/<hash>/...`.
+2. **S3 request rate per prefix.** About 834 writes per second on a bucket that also receives the uploads is within the documented per-prefix baseline, but S3 adds capacity by repartitioning gradually. Traffic concentrated on one prefix (for example a single date folder) or a sudden ramp-up can return `503 SlowDown`. The client retries with backoff (5 attempts), but sustained throttling adds latency and cost. Use high-cardinality key prefixes, for example `<yyyy>/<mm>/<dd>/<hh>/<hash>/...`.
 3. **Upload bandwidth from on-premises is the real throughput bottleneck.** 1,000,000 x 10 MB per hour is about 22 Gbit/s sustained into S3, before this feature runs at all. Compressing on-premises would cut that to about 5 Gbit/s and make this function unnecessary.
 4. **Duration grows with object size.** Compression is CPU-bound, at an estimated ~20 MiB/s at 1 GB. The average 10 MB file takes under a second, but a 1 GB file would approach the 60 s timeout. Raise `Timeout` and `MemorySize` if large outliers are expected. Objects that cannot finish within Lambda's 15-minute maximum (roughly 15 GB or more at this memory size), or ZIPs above the multipart limit of 10,000 × 5 MiB parts (~48 GiB), belong in AWS Batch or Fargate.
-5. **One invocation and one archive per file.** 730 million invocations, GETs, PUTs and HEADs a month cost about $4,500 in request charges alone. Bundling files into one archive per batch (S3 → SQS → Lambda batch) or per video divides that by the batch size and compresses better across similar JSON documents, at the price of more complex partial-failure handling.
+5. **One invocation and one archive per file.** 730 million invocations, GETs, PUTs and HEADs a month cost about $4,500 in request charges alone. Bundling files into one archive per batch (S3 → SQS → Lambda batch) or per video cuts invocations and per-archive requests. After multipart parts and SQS charges, the saving is about $2,500 a month for batches of 100. It also compresses better across similar JSON documents, at the price of more complex partial-failure handling.
 6. **ZIP is a poor fit for "further analysis".** Athena, Glue and Spark read gzip, zstd and bzip2 natively, but not ZIP. Every analytics job would first have to extract the archives. If the archives feed analytics, `.json.gz` or `.json.zst` (or converting the results to Parquet) keeps them queryable in place.
 7. **Event delivery is at least once, not exactly once.** Duplicates and overwrites are handled safely, but notifications can arrive late, S3 may send a single notification for two concurrent writes to the same key, and events that exhaust retries go to the failure queue. At 730 million events a month, even a tiny miss rate leaves originals behind. Add a daily reconciliation job driven by S3 Inventory (objects outside `archived/` older than a few hours), and a replay tool for the failure queue.
 8. **Deployments cause a burst of cold starts.** Moving the alias to a new version starts new execution environments for all ~200 concurrent requests at once. Container images are cached, so this mostly means a short latency spike. For safer releases, add `DeploymentPreference` (CodeDeploy canary or linear traffic shifting) with the error alarm as an automatic rollback trigger.
-9. **Single region.** A regional S3 or Lambda disruption pauses archiving. No data is lost, because originals stay in place and events are retried for 6 hours then parked, and the reconciliation job catches up afterwards.
+9. **Single region.** A regional S3 or Lambda disruption pauses archiving. Originals stay in place, events are retried for up to 6 hours and then kept in the failure queue for 14 days. The replay and reconciliation tooling from item 7 is not part of this repository and would be needed to catch up reliably.
 10. **Log volume.** At `INFO`, one line per file is about 306 GB of CloudWatch Logs a month. Run production at `WARN` and rely on metrics, keeping `INFO` for troubleshooting.
 
 ### Verdict
@@ -241,7 +241,7 @@ The architecture holds up at this scale: it is serverless and stateless, the gat
 
 ## Local development and testing
 
-Prerequisites: Node.js 24, Docker, AWS CLI v2, [AWS SAM CLI](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html), `cfn-lint`, and Python 3 (for the e2e fixtures).
+Prerequisites: Node.js 24, Docker, AWS CLI v2, [AWS SAM CLI](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html), `cfn-lint`, and Python 3, curl and jq (for the e2e test).
 
 ```bash
 make install    # npm ci in src/archiver
@@ -252,7 +252,7 @@ make validate   # sam validate --lint
 make build      # sam build (container image)
 ```
 
-The unit tests cover the safety cases above: conditional operations, archive reuse and generation conflicts, multipart abort on failure, long keys and duplicate deliveries. The e2e test builds the actual image and verifies ZIP contents byte for byte against moto for JSON, Unicode keys and a multipart-sized object, including a replayed event. CI runs all of these on every push and pull request.
+The unit tests cover the safety cases above: conditional operations, archive reuse and generation conflicts, multipart abort on failure, long keys and duplicate deliveries. The e2e test builds the actual image and verifies ZIP contents byte for byte against moto for JSON, Unicode keys and a multipart-sized object, including a replayed event. CI runs lint, unit tests, template validation and the e2e test on pushes and pull requests to `main`.
 
 Measure compression for the cost model inside the Lambda image. `--cpus 0.58` matches the CPU share of a 1,024 MB function:
 
@@ -266,7 +266,7 @@ node scripts/cost-estimate.mjs   # regenerate the cost tables
 
 ## Deployment
 
-The stack has no hourly charges: there is no NAT gateway or interface endpoint, and the S3 gateway endpoint is free. A test deployment therefore fits within the AWS Free Tier. Charges come only from usage (Lambda, S3, CloudWatch Logs) plus a few cents of ECR image storage and one CloudWatch alarm.
+The stack has no hourly charges: there is no NAT gateway or interface endpoint, and the S3 gateway endpoint is free. A small test deployment is typically covered by Free Tier allowances or credits, depending on the account. Charges come only from usage (Lambda, S3, CloudWatch Logs) plus a few cents of ECR image storage and one CloudWatch alarm.
 
 ```bash
 aws configure                      # or export AWS_PROFILE=...
@@ -280,9 +280,10 @@ make deploy AWS_REGION=us-east-1   # another region
 make deploy PARAMETER_OVERRIDES="ApplicationLogLevel=WARN SourcePrefix=incoming/ ArchiveStorageClass=GLACIER_IR"
 ```
 
-Try it:
+Try it with the default parameters (whole-bucket trigger, INFO logs):
 
 ```bash
+export AWS_REGION=ap-southeast-1   # the region you deployed to
 BUCKET=$(aws cloudformation describe-stacks --stack-name s3-zip-archiver \
   --query "Stacks[0].Outputs[?OutputKey=='BucketName'].OutputValue" --output text)
 echo '{"videoId":"v-1","frames":[{"t":0,"labels":["person"]}]}' > result.json
