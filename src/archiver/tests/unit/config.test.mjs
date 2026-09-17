@@ -5,7 +5,7 @@ import { loadConfig } from "../../lib/config.mjs";
 describe("loadConfig", () => {
   it("applies defaults", () => {
     assert.deepEqual(loadConfig({}), {
-      sourcePrefix: "incoming/",
+      sourcePrefix: "",
       archivePrefix: "archived/",
       compressionLevel: 6,
       storageClass: "STANDARD",
@@ -27,9 +27,15 @@ describe("loadConfig", () => {
     });
   });
 
-  it("rejects an archive prefix that would re-trigger the function", () => {
-    assert.throws(() => loadConfig({ SOURCE_PREFIX: "data/", ARCHIVE_PREFIX: "data/" }), /must differ/);
+  it("rejects prefixes that would skip every object", () => {
+    assert.throws(() => loadConfig({ SOURCE_PREFIX: "data/", ARCHIVE_PREFIX: "data/" }), /inside ARCHIVE_PREFIX/);
+    assert.throws(() => loadConfig({ SOURCE_PREFIX: "data/raw/", ARCHIVE_PREFIX: "data/" }), /inside ARCHIVE_PREFIX/);
     assert.throws(() => loadConfig({ ARCHIVE_PREFIX: "" }), /must not be empty/);
+  });
+
+  it("allows the archive prefix inside the source prefix", () => {
+    assert.equal(loadConfig({ SOURCE_PREFIX: "", ARCHIVE_PREFIX: "archived/" }).sourcePrefix, "");
+    assert.equal(loadConfig({ SOURCE_PREFIX: "data/", ARCHIVE_PREFIX: "data/archived/" }).sourcePrefix, "data/");
   });
 
   it("rejects invalid compression levels and storage classes", () => {

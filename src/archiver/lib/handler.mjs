@@ -1,11 +1,10 @@
+import { createHash } from "node:crypto";
 import path from "node:path";
-import {
-  DeleteObjectCommand,
-  GetObjectCommand,
-  HeadObjectCommand,
-} from "@aws-sdk/client-s3";
+import { DeleteObjectCommand, GetObjectCommand, HeadObjectCommand } from "@aws-sdk/client-s3";
 import { logger as defaultLogger } from "./logger.mjs";
-import { uploadZipArchive } from "./zip-upload.mjs";
+import { isPreconditionFailed, uploadZipArchive } from "./zip-upload.mjs";
+
+const MAX_KEY_BYTES = 1024;
 
 /**
  * Builds the Lambda handler. Dependencies are injected so the handler can be
@@ -40,7 +39,7 @@ export function createHandler({ s3, config, logger = defaultLogger }) {
 }
 
 export async function processRecord({ s3, config, logger, record }) {
-  const { bucket, key, eTag, versionId } = parseS3Record(record);
+  const { bucket, key, eTag, versionId, size } = parseS3Record(record);
   const skip = (reason) => {
     logger.info("Skipping object", { bucket, key, reason });
     return { status: "skipped", bucket, key, reason };
@@ -48,11 +47,42 @@ export async function processRecord({ s3, config, logger, record }) {
 
   if (key.startsWith(config.archivePrefix)) return skip("already-archived");
   if (!key.startsWith(config.sourcePrefix)) return skip("outside-source-prefix");
-  if (key.endsWith("/")) return skip("folder-placeholder");
+  if (key.endsWith("/") && size === 0) return skip("folder-placeholder");
 
   const startedAt = Date.now();
-  const archiveKey = archiveKeyFor(key, config);
 
+  // The canonical archive key is tried first. If it already holds an archive
+  // of a different source generation (the key was overwritten and archived
+  // before), the archive is written under a generation-specific key instead,
+  // so no archived content is ever replaced.
+  let archived;
+  for (const target of archiveTargets(key, versionId ?? eTag, config)) {
+    archived = await archiveTo({ s3, bucket, key, eTag, versionId, config, target });
+    if (archived.status !== "conflict") break;
+    logger.warn("Archive key holds another source generation", { bucket, key, archiveKey: target.archiveKey });
+  }
+  if (archived.status === "skipped") return skip(archived.reason);
+  if (archived.status === "conflict") {
+    throw new Error(`Every archive key for s3://${bucket}/${key} holds a different source generation`);
+  }
+
+  const sourceDeleted = await deleteSource({ s3, bucket, key, eTag, versionId, logger });
+
+  const result = {
+    status: "archived",
+    bucket,
+    key,
+    archiveKey: archived.archiveKey,
+    sourceDeleted,
+    sourceBytes: archived.sourceBytes,
+    archiveBytes: archived.archiveBytes,
+    durationMs: Date.now() - startedAt,
+  };
+  logger.info("Archived object", result);
+  return result;
+}
+
+async function archiveTo({ s3, bucket, key, eTag, versionId, config, target }) {
   // Pin the read to the exact object the event describes. If it was deleted
   // (already archived by an earlier delivery) or overwritten, a newer event
   // owns it, so there is nothing left to do here.
@@ -62,70 +92,68 @@ export async function processRecord({ s3, config, logger, record }) {
       new GetObjectCommand({ Bucket: bucket, Key: key, VersionId: versionId, IfMatch: quoteETag(eTag) }),
     );
   } catch (err) {
-    if (isNotFound(err)) return skip("source-not-found");
-    if (isPreconditionFailed(err)) return skip("source-changed");
+    if (isNotFound(err)) return { status: "skipped", reason: "source-not-found" };
+    if (isPreconditionFailed(err)) return { status: "skipped", reason: "source-changed" };
     throw err;
   }
 
-  const { bytes: archiveBytes } = await uploadZipArchive({
+  const sourceETag = stripQuotes(object.ETag ?? eTag ?? "");
+  const { bytes, created } = await uploadZipArchive({
     s3,
     source: object.Body,
-    entryName: path.posix.basename(key),
+    entryName: target.entryName,
     entryDate: object.LastModified,
     bucket,
-    key: archiveKey,
+    key: target.archiveKey,
     compressionLevel: config.compressionLevel,
     storageClass: config.storageClass,
+    // User metadata is limited to 2 KB, so only bounded values are stored;
+    // the full source key is recoverable from the archive key or entry name.
     metadata: {
-      "source-key": encodeURIComponent(key),
-      "source-etag": stripQuotes(object.ETag ?? eTag ?? ""),
+      "source-etag": sourceETag,
       "source-size": String(object.ContentLength ?? ""),
     },
   });
 
-  // Only remove the original once S3 confirms the complete archive exists.
-  const stored = await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: archiveKey }));
-  if (stored.ContentLength !== archiveBytes) {
+  // Only remove the original once S3 confirms a complete archive of this
+  // exact source exists. An existing archive counts only if it was produced
+  // from the same source ETag and has the size this run just produced
+  // (the output is deterministic for the same input and settings).
+  const stored = await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: target.archiveKey }));
+  if (!created && (stored.Metadata?.["source-etag"] !== sourceETag || stored.ContentLength !== bytes)) {
+    return { status: "conflict" };
+  }
+  if (stored.ContentLength !== bytes) {
     throw new Error(
-      `Archive s3://${bucket}/${archiveKey} has ${stored.ContentLength} bytes, expected ${archiveBytes}; keeping source`,
+      `Archive s3://${bucket}/${target.archiveKey} has ${stored.ContentLength} bytes, expected ${bytes}; keeping source`,
     );
   }
 
-  const sourceDeleted = await deleteSource({ s3, bucket, key, eTag, versionId, logger });
-
-  const result = {
-    status: "archived",
-    bucket,
-    key,
-    archiveKey,
-    sourceDeleted,
-    sourceBytes: object.ContentLength,
-    archiveBytes,
-    durationMs: Date.now() - startedAt,
-  };
-  logger.info("Archived object", result);
-  return result;
+  return { status: "archived", archiveKey: target.archiveKey, sourceBytes: object.ContentLength, archiveBytes: bytes };
 }
 
 async function deleteSource({ s3, bucket, key, eTag, versionId, logger }) {
-  if (!versionId) {
-    // Unversioned bucket: make sure the key still holds the object we archived
-    // so a concurrent overwrite is not deleted before it gets archived itself.
-    try {
-      await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: key, IfMatch: quoteETag(eTag) }));
-    } catch (err) {
-      if (isNotFound(err)) return true;
-      if (isPreconditionFailed(err)) {
-        logger.warn("Source changed after archiving; keeping the newer object", { bucket, key });
-        return false;
-      }
-      throw err;
+  try {
+    // Versioned bucket: permanently remove exactly the archived version.
+    // Otherwise the delete is conditional on the ETag, so an object written to
+    // the same key while archiving is kept for its own event to archive.
+    await s3.send(
+      new DeleteObjectCommand({
+        Bucket: bucket,
+        Key: key,
+        VersionId: versionId,
+        IfMatch: versionId ? undefined : quoteETag(eTag),
+      }),
+    );
+    return true;
+  } catch (err) {
+    if (isNotFound(err)) return true;
+    if (isPreconditionFailed(err)) {
+      logger.warn("Source changed after archiving; keeping the newer object", { bucket, key });
+      return false;
     }
+    throw err;
   }
-
-  // With a version ID this permanently removes exactly the archived version.
-  await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: key, VersionId: versionId }));
-  return true;
 }
 
 export function parseS3Record(record) {
@@ -139,11 +167,30 @@ export function parseS3Record(record) {
     key: decodeURIComponent(s3.object.key.replace(/\+/g, " ")),
     eTag: s3.object.eTag,
     versionId: s3.object.versionId,
+    size: s3.object.size,
   };
 }
 
-export function archiveKeyFor(key, { sourcePrefix, archivePrefix }) {
-  return `${archivePrefix}${key.slice(sourcePrefix.length)}.zip`;
+/**
+ * Candidate archive locations for a source key, in order of preference: the
+ * canonical key, then a key qualified with the source generation. Keys that
+ * would exceed S3's 1,024-byte limit are replaced by a hash of the source key,
+ * and the entry inside the ZIP keeps the full key.
+ */
+export function archiveTargets(key, generation, { sourcePrefix, archivePrefix }) {
+  const relative = key.slice(sourcePrefix.length);
+  const suffix = generation ? `.${generation.replace(/[^A-Za-z0-9_-]/g, "")}` : "";
+
+  let base = `${archivePrefix}${relative}`;
+  let entryName = path.posix.basename(key);
+  if (Buffer.byteLength(`${base}${suffix}.zip`) > MAX_KEY_BYTES) {
+    base = `${archivePrefix}_long-keys/${createHash("sha256").update(key).digest("hex")}`;
+    entryName = key;
+  }
+
+  const targets = [{ archiveKey: `${base}.zip`, entryName }];
+  if (suffix) targets.push({ archiveKey: `${base}${suffix}.zip`, entryName });
+  return targets;
 }
 
 function quoteETag(eTag) {
@@ -156,10 +203,6 @@ function stripQuotes(value) {
 
 function isNotFound(err) {
   return err?.name === "NoSuchKey" || err?.name === "NotFound" || err?.$metadata?.httpStatusCode === 404;
-}
-
-function isPreconditionFailed(err) {
-  return err?.name === "PreconditionFailed" || err?.$metadata?.httpStatusCode === 412;
 }
 
 function describeError(err) {
