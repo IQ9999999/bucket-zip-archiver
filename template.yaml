@@ -1,0 +1,132 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  S3 ZIP archiver - compresses every new object uploaded to the archive
+  bucket into a ZIP file in the same bucket and removes the original.
+
+Parameters:
+  SourcePrefix:
+    Type: String
+    Default: incoming/
+    AllowedPattern: "^[^/].*/$"
+    Description: Key prefix that triggers archiving. Must end with "/".
+  ArchivePrefix:
+    Type: String
+    Default: archived/
+    AllowedPattern: "^[^/].*/$"
+    Description: >
+      Key prefix the ZIP archives are written to. Must not overlap with
+      SourcePrefix, otherwise archives would re-trigger the function.
+  CompressionLevel:
+    Type: Number
+    Default: 6
+    MinValue: 0
+    MaxValue: 9
+    Description: zlib level (1 = fastest, 9 = smallest). 6 is the usual sweet spot.
+  ArchiveStorageClass:
+    Type: String
+    Default: STANDARD
+    AllowedValues: [STANDARD, STANDARD_IA, ONEZONE_IA, INTELLIGENT_TIERING, GLACIER_IR, GLACIER, DEEP_ARCHIVE]
+    Description: Storage class the ZIP archives are written with.
+
+Resources:
+  ArchiveBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      # The name is computed rather than referenced with !Ref from the
+      # function policy: the bucket's notification configuration already
+      # depends on the function, so a !Ref back would be circular.
+      BucketName: !Sub ${AWS::StackName}-${AWS::AccountId}-${AWS::Region}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      LifecycleConfiguration:
+        Rules:
+          # A timeout mid-upload leaves parts behind that are billed as storage.
+          - Id: AbortIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+
+  ArchiveBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArchiveBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !GetAtt ArchiveBucket.Arn
+              - !Sub ${ArchiveBucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  ArchiverFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Compresses new S3 objects into ZIP archives and deletes the originals
+      PackageType: Image
+      Architectures: [arm64]
+      MemorySize: 1024
+      Timeout: 60
+      Environment:
+        Variables:
+          SOURCE_PREFIX: !Ref SourcePrefix
+          ARCHIVE_PREFIX: !Ref ArchivePrefix
+          COMPRESSION_LEVEL: !Ref CompressionLevel
+          ARCHIVE_STORAGE_CLASS: !Ref ArchiveStorageClass
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Sid: ArchiveObjects
+              Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:GetObjectVersion
+                - s3:PutObject
+                - s3:AbortMultipartUpload
+                - s3:DeleteObject
+                - s3:DeleteObjectVersion
+              Resource: !Sub arn:${AWS::Partition}:s3:::${AWS::StackName}-${AWS::AccountId}-${AWS::Region}/*
+      Events:
+        ObjectCreated:
+          Type: S3
+          Properties:
+            Bucket: !Ref ArchiveBucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: !Ref SourcePrefix
+    Metadata:
+      Dockerfile: Dockerfile
+      DockerContext: ./src/archiver
+      DockerTag: nodejs24
+
+Outputs:
+  BucketName:
+    Description: Bucket to upload files to (under the source prefix)
+    Value: !Ref ArchiveBucket
+  UploadLocation:
+    Description: Objects uploaded here are archived automatically
+    Value: !Sub s3://${ArchiveBucket}/${SourcePrefix}
+  ArchiveLocation:
+    Description: Where the ZIP archives are written
+    Value: !Sub s3://${ArchiveBucket}/${ArchivePrefix}
+  ArchiverFunctionName:
+    Value: !Ref ArchiverFunction
