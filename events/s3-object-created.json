@@ -1,0 +1,32 @@
+{
+  "Records": [
+    {
+      "eventVersion": "2.1",
+      "eventSource": "aws:s3",
+      "awsRegion": "ap-southeast-1",
+      "eventTime": "2026-09-17T05:00:00.000Z",
+      "eventName": "ObjectCreated:Put",
+      "userIdentity": { "principalId": "AWS:AIDAEXAMPLEUPLOAD" },
+      "requestParameters": { "sourceIPAddress": "192.0.2.10" },
+      "responseElements": {
+        "x-amz-request-id": "C3D13FE58DE4C810",
+        "x-amz-id-2": "ExampleExtendedRequestIdForLocalTestingOnly"
+      },
+      "s3": {
+        "s3SchemaVersion": "1.0",
+        "configurationId": "archiver-incoming-object-created",
+        "bucket": {
+          "name": "example-archive-bucket",
+          "ownerIdentity": { "principalId": "EXAMPLEOWNER" },
+          "arn": "arn:aws:s3:::example-archive-bucket"
+        },
+        "object": {
+          "key": "incoming/reports/monthly+report.json",
+          "size": 1048576,
+          "eTag": "d41d8cd98f00b204e9800998ecf8427e",
+          "sequencer": "0069AA40D000000001"
+        }
+      }
+    }
+  ]
+}
