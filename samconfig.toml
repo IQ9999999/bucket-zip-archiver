@@ -1,0 +1,19 @@
+# Default settings for `sam build`, `sam validate` and `sam deploy`.
+# Override per environment with --config-env or --parameter-overrides.
+version = 0.1
+
+[default.global.parameters]
+stack_name = "s3-zip-archiver"
+region = "ap-southeast-1"
+
+[default.validate.parameters]
+lint = true
+
+[default.deploy.parameters]
+capabilities = "CAPABILITY_IAM"
+# Creates (once) and reuses a managed ECR repository for the function image.
+resolve_image_repos = true
+confirm_changeset = true
+fail_on_empty_changeset = false
+parameter_overrides = "ApplicationLogLevel=INFO LogRetentionInDays=14"
+tags = "project=\"s3-zip-archiver\""
