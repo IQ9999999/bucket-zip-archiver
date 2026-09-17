@@ -1,0 +1,14 @@
+# Node.js
+node_modules/
+coverage/
+npm-debug.log*
+
+# AWS SAM
+.aws-sam/
+samconfig.local.toml
+
+# Local tooling / OS
+.env
+.DS_Store
+.idea/
+.vscode/
