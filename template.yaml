@@ -192,6 +192,12 @@ Resources:
       Architectures: [arm64]
       MemorySize: 1024
       Timeout: 60
+      # Every deployment that changes the image or any function property
+      # publishes an immutable version and moves the "live" alias to it. The
+      # S3 trigger invokes the alias, so rolling back is a single alias update
+      # (see scripts/rollback.sh).
+      AutoPublishAlias: live
+      AutoPublishAliasAllProperties: true
       # SAM also attaches AWSLambdaVPCAccessExecutionRole so Lambda can manage
       # the function's network interfaces.
       VpcConfig:
@@ -247,6 +253,12 @@ Outputs:
     Value: !Sub s3://${ArchiveBucket}/${ArchivePrefix}
   ArchiverFunctionName:
     Value: !Ref ArchiverFunction
+  ArchiverFunctionAliasArn:
+    Description: Alias invoked by the S3 trigger
+    Value: !Ref ArchiverFunction.Alias
+  ArchiverFunctionVersionArn:
+    Description: Version published by this deployment
+    Value: !Ref ArchiverFunction.Version
   VpcId:
     Value: !Ref Vpc
   PrivateSubnetIds:
