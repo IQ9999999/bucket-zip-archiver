@@ -7,6 +7,7 @@ An AWS Lambda function, deployed with AWS SAM, that compresses every new object 
 - [Repository layout](#repository-layout)
 - [Design decisions](#design-decisions)
 - [Cost analysis](#cost-analysis)
+- [Scalability and bottlenecks](#scalability-and-bottlenecks)
 - [Local development and testing](#local-development-and-testing)
 - [Deployment](#deployment)
 - [Rollback](#rollback)
@@ -204,6 +205,39 @@ In order of impact:
 5. **Run production with `ApplicationLogLevel=WARN`** (−$218) and, if uploads can be confined to a prefix, **`SourcePrefix=incoming/`** (−$195), which removes the extra invocation for each archive.
 6. **Right-size memory** with [AWS Lambda Power Tuning](https://github.com/alexcasalboni/aws-lambda-power-tuning) on real files. Every 100 ms saved per file is worth ~$973 a month. Keep compression level 6: level 1 saves ~$2,100 a month of compute but costs ~$5,700 a month more storage for every month of data kept.
 7. **Keep S3 traffic on the gateway endpoint.** Routing it through NAT gateways instead would add roughly $487,000 a month in data processing charges; the template already avoids this.
+
+## Scalability and bottlenecks
+
+**Short answer:** yes, the solution scales to 1,000,000 files per hour without re-architecture, and it pays for itself many times over. The feature costs about $11,700 per month and cuts the storage bill by about $123,000 for every month of data retained. It is not the cheapest possible design at this volume, though: with one invocation and one archive per file, per-object request charges make up almost 40% of the feature cost, and several limits need to be raised or watched before production.
+
+### Load at the target volume
+
+| Dimension | Steady state | Limit / capacity | Headroom |
+| --- | --- | --- | --- |
+| Lambda invocations | 278/s archiving + 278/s skipped archive events | No invocation-rate quota for async S3 events | n/a |
+| Lambda concurrency | ~200 (278/s x 0.71 s) | 1,000 per account and region by default, shared by every function; new accounts can start lower | ~5x at average load; a 3x hourly peak reaches ~600 |
+| Lambda scale-up rate | | +1,000 concurrent executions every 10 s per function | Sufficient |
+| S3 writes (ingest PUT + archive PUT + DELETE) | ~834/s | 3,500/s per partitioned prefix | ~4x per prefix |
+| S3 reads (GET + HEAD) | ~556/s | 5,500/s per partitioned prefix | ~10x per prefix |
+| VPC IP addresses | A few Hyperplane ENIs shared per subnet and security group | 8,187 IPs per /19 subnet; 65,000 connections per Hyperplane ENI | Not a constraint |
+| Network to S3 | ~2.8 GB/s in from on-premises, ~3.4 GB/s via the gateway endpoint | Gateway endpoints have no throughput limit or charge | Not a constraint in AWS |
+
+### Concerns and potential bottlenecks
+
+1. **Account concurrency is shared.** About 200 steady executions, and roughly 600 at a 3x peak, sit on the default regional quota of 1,000 that every other function in the account also uses. If the quota is hit, S3 events are throttled and queued, Lambda retries them for up to 6 hours, and then they go to the failure queue. Before go-live, request a quota increase. Consider reserved concurrency to protect other workloads, and alarm on `Throttles`, `AsyncEventAge` and `AsyncEventsDropped`.
+2. **S3 request rate per prefix.** About 834 writes per second on a bucket that also receives the uploads is within the per-prefix limit, but S3 repartitions gradually. Traffic concentrated on one prefix (for example a single date folder) or a sudden ramp-up can return `503 SlowDown`. The client retries with backoff (5 attempts), but sustained throttling adds latency and cost. Use high-cardinality key prefixes, for example `<yyyy>/<mm>/<dd>/<hh>/<hash>/...`.
+3. **Upload bandwidth from on-premises is the real throughput bottleneck.** 1,000,000 x 10 MB per hour is about 22 Gbit/s sustained into S3, before this feature runs at all. Compressing on-premises would cut that to about 5 Gbit/s and make this function unnecessary.
+4. **Duration grows with object size.** Compression is CPU-bound, at an estimated ~20 MiB/s at 1 GB. The average 10 MB file takes under a second, but a 1 GB file would approach the 60 s timeout. Raise `Timeout` and `MemorySize` if large outliers are expected. Objects that cannot finish within Lambda's 15-minute maximum (roughly 15 GB or more at this memory size), or ZIPs above the multipart limit of 10,000 × 5 MiB parts (~48 GiB), belong in AWS Batch or Fargate.
+5. **One invocation and one archive per file.** 730 million invocations, GETs, PUTs and HEADs a month cost about $4,500 in request charges alone. Bundling files into one archive per batch (S3 → SQS → Lambda batch) or per video divides that by the batch size and compresses better across similar JSON documents, at the price of more complex partial-failure handling.
+6. **ZIP is a poor fit for "further analysis".** Athena, Glue and Spark read gzip, zstd and bzip2 natively, but not ZIP. Every analytics job would first have to extract the archives. If the archives feed analytics, `.json.gz` or `.json.zst` (or converting the results to Parquet) keeps them queryable in place.
+7. **Event delivery is at least once, not exactly once.** Duplicates and overwrites are handled safely, but notifications can arrive late, S3 may send a single notification for two concurrent writes to the same key, and events that exhaust retries go to the failure queue. At 730 million events a month, even a tiny miss rate leaves originals behind. Add a daily reconciliation job driven by S3 Inventory (objects outside `archived/` older than a few hours), and a replay tool for the failure queue.
+8. **Deployments cause a burst of cold starts.** Moving the alias to a new version starts new execution environments for all ~200 concurrent requests at once. Container images are cached, so this mostly means a short latency spike. For safer releases, add `DeploymentPreference` (CodeDeploy canary or linear traffic shifting) with the error alarm as an automatic rollback trigger.
+9. **Single region.** A regional S3 or Lambda disruption pauses archiving. No data is lost, because originals stay in place and events are retried for 6 hours then parked, and the reconciliation job catches up afterwards.
+10. **Log volume.** At `INFO`, one line per file is about 306 GB of CloudWatch Logs a month. Run production at `WARN` and rely on metrics, keeping `INFO` for troubleshooting.
+
+### Verdict
+
+The architecture holds up at this scale: it is serverless and stateless, the gateway endpoint removes the network bottleneck, and the processing path is idempotent. Before production, raise the Lambda concurrency quota, use distributed key prefixes, add alarms and a reconciliation job, and right-size memory with [AWS Lambda Power Tuning](https://github.com/alexcasalboni/aws-lambda-power-tuning) against real files. For the lowest total cost at 1,000,000 files per hour, the better long-term design compresses at the source, or batches many results per archive, in a format analytics tools can read directly (gzip/zstd).
 
 ## Local development and testing
 
