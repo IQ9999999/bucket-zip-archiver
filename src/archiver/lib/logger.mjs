@@ -5,6 +5,7 @@
  * Level filtering is handled by the function's ApplicationLogLevel setting.
  */
 export const logger = {
+  debug: (message, fields = {}) => console.debug({ message, ...fields }),
   info: (message, fields = {}) => console.info({ message, ...fields }),
   warn: (message, fields = {}) => console.warn({ message, ...fields }),
   error: (message, fields = {}) => console.error({ message, ...fields }),

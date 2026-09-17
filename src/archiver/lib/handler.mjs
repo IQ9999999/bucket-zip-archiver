@@ -40,12 +40,14 @@ export function createHandler({ s3, config, logger = defaultLogger }) {
 
 export async function processRecord({ s3, config, logger, record }) {
   const { bucket, key, eTag, versionId, size } = parseS3Record(record);
-  const skip = (reason) => {
-    logger.info("Skipping object", { bucket, key, reason });
+  const skip = (reason, level = "info") => {
+    logger[level]("Skipping object", { bucket, key, reason });
     return { status: "skipped", bucket, key, reason };
   };
 
-  if (key.startsWith(config.archivePrefix)) return skip("already-archived");
+  // Expected once per archive when the trigger covers the whole bucket, so it
+  // is logged at debug level to keep CloudWatch ingestion flat.
+  if (key.startsWith(config.archivePrefix)) return skip("already-archived", "debug");
   if (!key.startsWith(config.sourcePrefix)) return skip("outside-source-prefix");
   if (key.endsWith("/") && size === 0) return skip("folder-placeholder");
 

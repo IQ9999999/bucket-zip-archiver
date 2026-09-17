@@ -24,7 +24,7 @@ const ETAG = "0123456789abcdef";
 const SOURCE_KEY = "2026/09/result.json";
 const ARCHIVE_KEY = "archived/2026/09/result.json.zip";
 const LAST_MODIFIED = new Date("2026-09-01T10:00:00Z");
-const silentLogger = { info() {}, warn() {}, error() {} };
+const silentLogger = { debug() {}, info() {}, warn() {}, error() {} };
 
 const s3 = new S3Client({ region: "ap-southeast-1", credentials: { accessKeyId: "test", secretAccessKey: "test" } });
 const s3Mock = mockClient(s3);
