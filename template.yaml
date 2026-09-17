@@ -28,8 +28,117 @@ Parameters:
     Default: STANDARD
     AllowedValues: [STANDARD, STANDARD_IA, ONEZONE_IA, INTELLIGENT_TIERING, GLACIER_IR, GLACIER, DEEP_ARCHIVE]
     Description: Storage class the ZIP archives are written with.
+  VpcCidr:
+    Type: String
+    Default: 10.20.0.0/16
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+  PrivateSubnetACidr:
+    Type: String
+    Default: 10.20.0.0/19
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+  PrivateSubnetBCidr:
+    Type: String
+    Default: 10.20.32.0/19
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
 
 Resources:
+  # ---------------------------------------------------------------------------
+  # Network: a VPC with private subnets only. There is no internet gateway or
+  # NAT gateway; the function reaches S3 through a (free) gateway endpoint.
+  # ---------------------------------------------------------------------------
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-vpc
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PrivateSubnetACidr
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-private-a
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PrivateSubnetBCidr
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-private-b
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-private
+
+  PrivateSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetA
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetB
+      RouteTableId: !Ref PrivateRouteTable
+
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      VpcEndpointType: Gateway
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+      RouteTableIds:
+        - !Ref PrivateRouteTable
+      # Only the archive bucket is reachable from inside the VPC.
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: ArchiveBucketOnly
+            Effect: Allow
+            Principal: "*"
+            Action:
+              - s3:GetObject
+              - s3:GetObjectVersion
+              - s3:PutObject
+              - s3:AbortMultipartUpload
+              - s3:DeleteObject
+              - s3:DeleteObjectVersion
+            Resource: !Sub arn:${AWS::Partition}:s3:::${AWS::StackName}-${AWS::AccountId}-${AWS::Region}/*
+
+  ArchiverSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Archiver Lambda - no inbound, HTTPS outbound only
+      VpcId: !Ref Vpc
+      # The route table only has the local route and the S3 prefix list, so
+      # HTTPS egress can only reach S3 through the gateway endpoint.
+      SecurityGroupEgress:
+        - Description: HTTPS to S3 via the gateway endpoint
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+
+  # ---------------------------------------------------------------------------
+  # Storage and compute
+  # ---------------------------------------------------------------------------
   ArchiveBucket:
     Type: AWS::S3::Bucket
     Properties:
@@ -83,6 +192,14 @@ Resources:
       Architectures: [arm64]
       MemorySize: 1024
       Timeout: 60
+      # SAM also attaches AWSLambdaVPCAccessExecutionRole so Lambda can manage
+      # the function's network interfaces.
+      VpcConfig:
+        SubnetIds:
+          - !Ref PrivateSubnetA
+          - !Ref PrivateSubnetB
+        SecurityGroupIds:
+          - !Ref ArchiverSecurityGroup
       Environment:
         Variables:
           SOURCE_PREFIX: !Ref SourcePrefix
@@ -130,3 +247,7 @@ Outputs:
     Value: !Sub s3://${ArchiveBucket}/${ArchivePrefix}
   ArchiverFunctionName:
     Value: !Ref ArchiverFunction
+  VpcId:
+    Value: !Ref Vpc
+  PrivateSubnetIds:
+    Value: !Join [",", [!Ref PrivateSubnetA, !Ref PrivateSubnetB]]
