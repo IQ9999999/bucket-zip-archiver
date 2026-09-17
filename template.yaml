@@ -28,6 +28,21 @@ Parameters:
     Default: STANDARD
     AllowedValues: [STANDARD, STANDARD_IA, ONEZONE_IA, INTELLIGENT_TIERING, GLACIER_IR, GLACIER, DEEP_ARCHIVE]
     Description: Storage class the ZIP archives are written with.
+  ApplicationLogLevel:
+    Type: String
+    Default: INFO
+    AllowedValues: [TRACE, DEBUG, INFO, WARN, ERROR, FATAL]
+    Description: >
+      Minimum application log level. At millions of invocations per hour,
+      WARN avoids paying CloudWatch ingestion for one line per archived file.
+  LogRetentionInDays:
+    Type: Number
+    Default: 14
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 180, 365]
+  AlarmTopicArn:
+    Type: String
+    Default: ""
+    Description: Optional SNS topic notified when events land in the failure queue.
   VpcCidr:
     Type: String
     Default: 10.20.0.0/16
@@ -40,6 +55,9 @@ Parameters:
     Type: String
     Default: 10.20.32.0/19
     AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+
+Conditions:
+  HasAlarmTopic: !Not [!Equals [!Ref AlarmTopicArn, ""]]
 
 Resources:
   # ---------------------------------------------------------------------------
@@ -206,6 +224,22 @@ Resources:
           - !Ref PrivateSubnetB
         SecurityGroupIds:
           - !Ref ArchiverSecurityGroup
+      # JSON logs keep the structured fields queryable. SystemLogLevel WARN
+      # drops the START/END/REPORT lines emitted for every invocation.
+      LoggingConfig:
+        LogFormat: JSON
+        ApplicationLogLevel: !Ref ApplicationLogLevel
+        SystemLogLevel: WARN
+        LogGroup: !Ref ArchiverLogGroup
+      # S3 invokes asynchronously: retry transient failures twice, then park
+      # the event in SQS so no object is silently left unarchived.
+      EventInvokeConfig:
+        MaximumRetryAttempts: 2
+        MaximumEventAgeInSeconds: 21600
+        DestinationConfig:
+          OnFailure:
+            Type: SQS
+            Destination: !GetAtt FailedEventsQueue.Arn
       Environment:
         Variables:
           SOURCE_PREFIX: !Ref SourcePrefix
@@ -241,6 +275,38 @@ Resources:
       DockerContext: ./src/archiver
       DockerTag: nodejs24
 
+  # ---------------------------------------------------------------------------
+  # Operations
+  # ---------------------------------------------------------------------------
+  ArchiverLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-archiver
+      RetentionInDays: !Ref LogRetentionInDays
+
+  FailedEventsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600 # 14 days, the maximum
+      SqsManagedSseEnabled: true
+
+  FailedEventsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: S3 events failed to archive after all retries. Inspect the queue and replay.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt FailedEventsQueue.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref AWS::NoValue]
+
 Outputs:
   BucketName:
     Description: Bucket to upload files to (under the source prefix)
@@ -259,6 +325,11 @@ Outputs:
   ArchiverFunctionVersionArn:
     Description: Version published by this deployment
     Value: !Ref ArchiverFunction.Version
+  FailedEventsQueueUrl:
+    Description: Events that could not be archived after all retries
+    Value: !Ref FailedEventsQueue
+  LogGroupName:
+    Value: !Ref ArchiverLogGroup
   VpcId:
     Value: !Ref Vpc
   PrivateSubnetIds:
