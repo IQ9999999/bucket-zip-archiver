@@ -13,6 +13,9 @@ lint = true
 capabilities = "CAPABILITY_IAM"
 # Creates (once) and reuses a managed ECR repository for the function image.
 resolve_image_repos = true
+# SAM uploads the ECR companion stack's template to S3, so it also needs its
+# managed artifacts bucket (aws-sam-cli-managed-default).
+resolve_s3 = true
 confirm_changeset = true
 fail_on_empty_changeset = false
 tags = "project=\"s3-zip-archiver\""
