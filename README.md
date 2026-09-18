@@ -10,6 +10,7 @@ An AWS Lambda function, deployed with AWS SAM, that compresses every new object 
 - [Scalability and bottlenecks](#scalability-and-bottlenecks)
 - [Local development and testing](#local-development-and-testing)
 - [Deployment](#deployment)
+- [Deployment verification](#deployment-verification)
 - [Rollback](#rollback)
 - [Teardown](#teardown)
 
@@ -50,6 +51,7 @@ If any step fails, the invocation fails. Lambda retries it twice and then sends 
 | 2 | Lambda in private subnets of a VPC defined in the same template | `Vpc`, `PrivateSubnetA/B`, `S3GatewayEndpoint`, `VpcConfig` |
 | 2 | Dockerized Lambda | `PackageType: Image`, [`src/archiver/Dockerfile`](src/archiver/Dockerfile) |
 | 2 | New version on each deployment, reliable rollback | `AutoPublishAlias: live`, `AutoPublishAliasAllProperties`, `AWS::LanguageExtensions`, `ReleaseId`, [`scripts/rollback.sh`](scripts/rollback.sh) |
+| 2 | Deployment examined on a personal AWS account | [Deployment verification](#deployment-verification) |
 | 3 | Incremental commits, README | `git log`, this file |
 | 4 | Monthly cost at 1,000,000 files/hour, 10 MB each | [Cost analysis](#cost-analysis) |
 | 5 | Scalability, cost efficiency and bottlenecks | [Scalability and bottlenecks](#scalability-and-bottlenecks) |
@@ -291,6 +293,51 @@ aws s3 cp result.json "s3://$BUCKET/2026/09/17/result.json"
 aws logs tail /aws/lambda/s3-zip-archiver-archiver --follow   # "Archived object"
 aws s3 ls "s3://$BUCKET" --recursive                          # archived/2026/09/17/result.json.zip
 ```
+
+## Deployment verification
+
+The stack was deployed with `make deploy` to a personal AWS account in **ap-southeast-1** on 2026-09-18 and tested end to end. The account ID is masked as `<account>` below.
+
+**Stack outputs (abridged)**
+
+| Output | Value |
+| --- | --- |
+| BucketName | `s3-zip-archiver-<account>-ap-southeast-1` |
+| ArchiverFunctionAliasArn | `arn:aws:lambda:ap-southeast-1:<account>:function:s3-zip-archiver-ArchiverFunction-4ysLL0cA4vdR:live` |
+| VpcId / PrivateSubnetIds | `vpc-045f687225d1013b8` / `subnet-0d60af72e20256938`, `subnet-0472d1b6f48c16e14` |
+| LogGroupName | `/aws/lambda/s3-zip-archiver-archiver` |
+
+**Results**
+
+| Check | Result |
+| --- | --- |
+| Upload `2026/09/18/result.json` (4,176,814 bytes of detection JSON) | Archived to `archived/2026/09/18/result.json.zip` (874,639 bytes, 4.8x smaller) within ~5 s; original deleted |
+| Upload `2026/09/18/vidéo 124/small result.json` (spaces and non-ASCII in the key) | Archived to `archived/2026/09/18/vidéo 124/small result.json.zip`; original deleted |
+| Download and unzip both archives | One entry each; SHA-256 identical to the uploaded files (`f2604420…c73dd75d`, `56357235…2d105d9c`) |
+| Archive object | `application/zip`, SSE-S3 (`AES256`), metadata `source-etag` and `source-size` |
+| Function configuration | `PackageType: Image`, `arm64`, 1,024 MB, attached to both private subnets, JSON log format |
+| VPC routing | Route tables contain only the `local` route and the S3 prefix list via the gateway endpoint; no internet or NAT gateway |
+| Replay the same S3 event (duplicate delivery) plus an archive-key event | `{"status":"skipped","reason":"source-not-found"}` and `{"status":"skipped","reason":"already-archived"}`: S3 answered 404, not 403, and nothing changed |
+| Failure queue | 0 messages |
+| Logs | One structured `Archived object` line per file; START/END/REPORT lines suppressed |
+
+**Versioning and rollback.** A second `make deploy` that changed only the release label published version 2, which confirms that parameter-only deployments publish a version. The previous version was retained:
+
+```text
+Alias 'live' of s3-zip-archiver-ArchiverFunction-4ysLL0cA4vdR -> version 2
+|  1|  2026-09-18T10:48:04 | af476ff5…1f3df231 | release ade7f13-20260918104451 |
+|  2|  2026-09-18T10:52:50 | af476ff5…1f3df231 | release ade7f13-20260918105217 |
+
+$ scripts/rollback.sh previous
+Alias 'live' moved from version 2 to 1
+# a file uploaded now was processed by version 1 (log stream ...ArchiverFunction-4ysLL0cA4vdR[1]...)
+$ scripts/rollback.sh 2
+Alias 'live' moved from version 1 to 2
+```
+
+**Observed duration.** The first invocation, on a new execution environment, archived the 4.2 MB file in 0.89 s of handler time. This single cold sample suggests the 0.713 s per 10 MB file assumed in the cost model is optimistic; the [sensitivity table](#sensitivity) covers 1–1.5 s. Production figures should come from the `Duration` metric under sustained load.
+
+**Issue found and fixed during deployment.** On a fresh account, `sam deploy` failed with "S3 Bucket not specified": `resolve_image_repos` stores its ECR companion stack template in S3. `samconfig.toml` now also sets `resolve_s3 = true`.
 
 ## Rollback
 
