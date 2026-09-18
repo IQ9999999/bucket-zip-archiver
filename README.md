@@ -252,7 +252,7 @@ make validate   # sam validate --lint
 make build      # sam build (container image)
 ```
 
-The unit tests cover the safety cases above: conditional operations, archive reuse and generation conflicts, multipart abort on failure, long keys and duplicate deliveries. The e2e test builds the actual image and verifies ZIP contents byte for byte against moto for JSON, Unicode keys and a multipart-sized object, including a replayed event. CI runs lint, unit tests, template validation and the e2e test on pushes and pull requests to `main`.
+The unit tests cover the safety cases above: conditional operations, archive reuse and generation conflicts, multipart abort on failure, long keys and duplicate deliveries. The e2e test builds the actual image and verifies ZIP contents byte for byte against moto for JSON, Unicode keys and a multipart-sized object, including a replayed event. CI runs lint, unit tests, template validation and the e2e test on pushes and pull requests to `master`.
 
 Measure compression for the cost model inside the Lambda image. `--cpus 0.58` matches the CPU share of a 1,024 MB function:
 
